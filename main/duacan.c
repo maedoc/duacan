@@ -2,6 +2,7 @@
 #include <freertos/task.h>
 #include <esp_log.h>
 #include <hal/cpu_hal.h>
+#include <stdatomic.h>
 
 #include "duacan.h"
 
@@ -118,13 +119,6 @@ void duacan_log_alerts(twai_handle_t can)
   }
 }
 
-typedef struct rbuf {
-  uint32_t head;
-  twai_message_t buf[1024];
-} rbuf_t;
-
-static rbuf_t rx0buf = {0}, rx1buf = {0};
-
 IRAM_ATTR static void duacan_pump(duacan_handler_t handler)
 {
   TickType_t patience = pdMS_TO_TICKS(10.f);
@@ -191,6 +185,7 @@ static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
   g.alerts_enabled = TWAI_ALERT_ALL;
   g.controller_id = id;
   g.rx_queue_len = 128;
+  g.tx_queue_len = 128;
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
   esp_err_t install_err, start_err;
 
