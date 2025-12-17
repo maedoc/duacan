@@ -119,9 +119,106 @@ void duacan_log_alerts(twai_handle_t can)
   }
 }
 
-IRAM_ATTR static void duacan_pump(duacan_handler_t handler)
+
+// to ensure handler is fast, processing is slow,
+// XXX next step is to pull frames into a ring buffer and have another task
+// process, so we prioritize RX; TX can be split into slow/fast
+// we'll use xtasknotify to event the processing task with the current head
+// but the task should maintain its own head.  since buffer is 1024 entries,
+// use an rshift to figure out the current index, e.g. `index = head & 0x3FF`
+// and lap count can be `head >> 10`.
+
+#include <stdatomic.h>
+
+typedef struct rb_slot {
+  atomic_uint seq; // even -> ok, odd -> being written
+  twai_message_t msg;
+} rb_slot_t;
+
+typedef struct duacan_rbuf {
+  atomic_size_t head;
+  rb_slot_t buf[1024];
+} rbuf_t;
+
+static rbuf_t rx0buf = {0}, rx1buf = {0};
+
+// assume high priority writer, low priority reader, readers may not keep up
+IRAM_ATTR static void rb_write(rbuf_t *rb, const twai_message_t *frame)
+{
+  size_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+  uint32_t idx = head & 0x3FF; // == head % 1024
+  rb_slot_t *slot = &rb->buf[idx];
+  // seq stores most of head, last bit is write-in-progress flag
+  atomic_store_explicit(&slot->seq, (head << 1) | 1, memory_order_relaxed);
+  atomic_thread_fence(memory_order_release);
+  // do non-atmomic write
+  slot->msg = *frame;
+  // clear last bit -> write finished
+  atomic_store_explicit(&slot->seq, head << 1, memory_order_release);
+  // advance head
+  atomic_store_explicit(&rb->head, head + 1, memory_order_release);
+}
+
+IRAM_ATTR static esp_err_t rb_read(rbuf_t *rb, size_t *tail, twai_message_t *frame)
+{
+  size_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+  if (*tail == head) return ESP_ERR_TIMEOUT; // not really timeout but no new data
+  if (head - *tail > 1024) // skip ahead for slow reader TODO stats
+    *tail = head - 1024;
+  rb_slot_t *slot = &rb->buf[*tail & 0x3FF];
+  uint32_t seq0=0, seq1=0;
+  do {
+    seq0 = atomic_load_explicit(&slot->seq, memory_order_acquire);
+    if (seq0 & 1) continue; // being written
+    *frame = slot->msg; // non-atomic read protected by seq even/odd
+    atomic_thread_fence(memory_order_acquire);
+    seq1 = atomic_load_explicit(&slot->seq, memory_order_relaxed);
+  } while (seq0 != seq1); // changed during read, try again
+  size_t src_head = seq0 >> 1;
+  if (src_head != *tail)
+    *tail = src_head + 1; // skip ahead due to lap
+  else
+    (*tail)++; // advance reader
+  return ESP_OK;
+}
+
+IRAM_ATTR esp_err_t duacan_read(twai_handle_t c, size_t *tail, twai_message_t *frame)
+{
+  rbuf_t *rb = (c == can0) ? &rx0buf : &rx1buf;
+  return rb_read(rb, tail, frame);
+}
+
+TaskHandle_t subs[2][4] = {0};
+
+esp_err_t duacan_subscribe(twai_handle_t can, TaskHandle_t reader_task)
+{
+  int id = can == can0 ? 0 : 1;
+  for (int i=0; i<4; i++) {
+    if (subs[id][i] == NULL) {
+      subs[id][i] = reader_task;
+      return ESP_OK;
+    }
+  }
+  ESP_LOGW(TAG, "duacan_subscribe: can%d has no more subscription slots", id);
+  return ESP_ERR_NO_MEM;
+}
+
+// if handler is NULL, pump writes frames into 
+IRAM_ATTR static void default_handler(const twai_handle_t can, const twai_message_t *frame)
+{
+  int id = can == can0 ? 0 : 1;
+  rbuf_t *rb = can == can0 ? &rx0buf : &rx1buf;
+  rb_write(rb, frame);
+  // notify
+  for (int i=0; i<4; i++)
+    if (subs[id][i] != NULL)
+      xTaskNotify(subs[id][i], rb->head, eSetValueWithOverwrite);
+}
+
+IRAM_ATTR static void pump(duacan_handler_t caller_handler)
 {
   TickType_t patience = pdMS_TO_TICKS(10.f);
+  duacan_handler_t handler = caller_handler != NULL ? caller_handler : default_handler;
   while (1) {
     bool worked = false;
     uint32_t tik = cpu_hal_get_cycle_count();
@@ -154,7 +251,7 @@ IRAM_ATTR static void duacan_pump(duacan_handler_t handler)
   }
 }
 
-static void duacan_nanny()
+static void nanny()
 {
   float delay_s = 2.f;
   ESP_LOGI(TAG, "duacan_nanny started with %.2f s delay", delay_s);
@@ -213,10 +310,10 @@ esp_err_t duacan_start(
   esp_err_t e1 = start_one(1, tx1, rx1, time1);
   if (e0 != ESP_OK || e1 != ESP_OK)
     return ESP_FAIL;
-  BaseType_t pump_ret = xTaskCreate((void(*)(void*)) duacan_pump, "duacan_pump", 8192, (void*) handler, 15, &pump_task);
+  BaseType_t pump_ret = xTaskCreate((void(*)(void*)) pump, "duacan_pump", 8192, (void*) handler, 15, &pump_task);
   if (pump_ret != pdPASS)
     ESP_LOGE(TAG, "Failed to create duacan_pump task");
-  BaseType_t nanny_ret = xTaskCreate(duacan_nanny, "duacan_nanny", 8192, NULL, 5, &nanny_task);
+  BaseType_t nanny_ret = xTaskCreate(nanny, "duacan_nanny", 8192, NULL, 5, &nanny_task);
   if (nanny_ret != pdPASS)
     ESP_LOGE(TAG, "Failed to create duacan_nanny task");
   return (pump_ret == pdPASS && nanny_ret == pdPASS) ? ESP_OK : ESP_FAIL;

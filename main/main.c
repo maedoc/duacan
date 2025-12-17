@@ -16,6 +16,7 @@ static const char *TAG = "main";
 
 static int rx0=0, rx1=0;
 
+// this can be provided as a handler to be called directly in pump hotspot but needs to be fast
 IRAM_ATTR static void pingpong(const twai_handle_t can, const twai_message_t *frame) {
   twai_message_t next = *frame;
   if (can == can0)
@@ -37,86 +38,64 @@ IRAM_ATTR static void pingpong(const twai_handle_t can, const twai_message_t *fr
   }
 }
 
-// to ensure handler is fast, processing is slow,
-// XXX next step is to pull frames into a ring buffer and have another task
-// process, so we prioritize RX; TX can be split into slow/fast
-// we'll use xtasknotify to event the processing task with the current head
-// but the task should maintain its own head.  since buffer is 1024 entries,
-// use an rshift to figure out the current index, e.g. `index = head & 0x3FF`
-// and lap count can be `head >> 10`.
-
-#include <stdatomic.h>
-typedef struct rb_slot {
-  atomic_uint seq; // even -> ok, odd -> being written
-  twai_message_t msg;
-} rb_slot_t;
-
-typedef struct rbuf {
-  atomic_size_t head;
-  rb_slot_t buf[1024];
-} rbuf_t;
-
-static rbuf_t rx0buf = {0}, rx1buf = {0};
-
-IRAM_ATTR static uint32_t rbuf_idx(rbuf_t *b) { return b->head & 0x3FF; }
-IRAM_ATTR static uint32_t rbuf_lap(rbuf_t *b) { return b->head >> 10; }
-
-// well macro versions are better
-#define RBUF_IDX(b) ((b)->head & 0x3FF)
-#define RBUF_LAP(b) ((b)->head >> 10)
-
-// assume high priority writer, low priority reader, readers may not keep up
-IRAM_ATTR void rb_write(rbuf_t *rb, const twai_message_t *frame)
+// this can be used for high latency processing.
+IRAM_ATTR static void reader()
 {
-  size_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
-  uint32_t idx = head & 0x3FF; // == head % 1024
-  rb_slot_t *slot = &rb->buf[idx];
-  // seq stores most of head, last bit is write-in-progress flag
-  atomic_store_explicit(&slot->seq, (head << 1) | 1, memory_order_relaxed);
-  atomic_thread_fence(memory_order_release);
-  // do non-atmomic write
-  slot->msg = *frame;
-  // clear last bit -> write finished
-  atomic_store_explicit(&slot->seq, head << 1, memory_order_release);
-  // advance head
-  atomic_store_explicit(&rb->head, head + 1, memory_order_release);
+  size_t tail0=0, tail1=0;
+  while (1)
+  {
+    {
+      twai_message_t frame = {0};
+      while (duacan_read(can0, &tail0, &frame) == ESP_OK)
+        pingpong(can0, &frame);
+    }
+    {
+      twai_message_t frame = {0};
+      while (duacan_read(can1, &tail1, &frame) == ESP_OK)
+        pingpong(can1, &frame);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
-IRAM_ATTR esp_err_t rb_read(rbuf_t *rb, size_t *tail, twai_message_t *frame)
+// tasknotify-based subscriber
+IRAM_ATTR static void sub0(void*)
 {
-  size_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
-  if (*tail == head) return ESP_ERR_TIMEOUT; // not really timeout but no new data
-  if (head - *tail > 1024) // skip ahead for slow reader TODO stats
-    *tail = head - 1024;
-  rb_slot_t *slot = &rb->buf[*tail & 0x3FF];
-  uint32_t seq0=0, seq1=0;
-  do {
-    seq0 = atomic_load_explicit(&slot->seq, memory_order_acquire);
-    if (seq0 & 1) continue; // being written
-    *frame = slot->msg; // non-atomic read protected by seq even/odd
-    atomic_thread_fence(memory_order_acquire);
-    seq1 = atomic_load_explicit(&slot->seq, memory_order_relaxed);
-  } while (seq0 != seq1); // changed during read, try again
-  size_t src_head = seq0 >> 1;
-  if (src_head != *tail)
-    *tail = src_head + 1; // skip ahead due to lap
-  else
-    (*tail)++; // advance reader
-  return ESP_OK;
+  duacan_subscribe(can0, xTaskGetCurrentTaskHandle());
+  size_t tail=0;
+  uint32_t notif_val;
+  twai_message_t frame;
+  while (1)
+  {
+    xTaskNotifyWait(0, 0xffffffff, &notif_val, portMAX_DELAY);
+    while (duacan_read(can0, &tail, &frame) == ESP_OK)
+      pingpong(can0, &frame);
+  }
 }
 
-// build a xtasknotify multicast to multiple readers to keep pump fast
-// use uint32_t atomic instructions to avoid critical sections or ISR hit
-// suggestions in the gemini chat c6-can redesign
-// segment tx into tx_urgent and tx_lazy
-// on single core, critical section is ok
+IRAM_ATTR static void sub1(void*)
+{
+  duacan_subscribe(can1, xTaskGetCurrentTaskHandle());
+  size_t tail=0;
+  uint32_t notif_val;
+  twai_message_t frame;
+  while (1)
+  {
+    xTaskNotifyWait(0, 0xffffffff, &notif_val, portMAX_DELAY);
+    while (duacan_read(can1, &tail, &frame) == ESP_OK)
+      pingpong(can1, &frame);
+  }
+}
 
 void app_main(void) {
   twai_timing_config_t can_time = TWAI_TIMING_CONFIG_500KBITS();
   assert(ESP_OK == duacan_start(
         CAN0_TX, CAN0_RX, can_time,
         CAN1_TX, CAN1_RX, can_time,
-        pingpong));
+        NULL));
+  /* xTaskCreate(reader, "reader", 4096, NULL, 10, NULL); */
+  xTaskCreate(sub0, "sub0", 4096, NULL, 10, NULL);
+  xTaskCreate(sub1, "sub1", 4096, NULL, 10, NULL);
   xTaskCreate(start_pings, "start_pings", 4096, NULL, 5, NULL);
 }
 
