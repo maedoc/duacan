@@ -89,7 +89,7 @@ IRAM_ATTR esp_err_t rb_read(rbuf_t *rb, size_t *tail, twai_message_t *frame)
   if (head - *tail > 1024) // skip ahead for slow reader TODO stats
     *tail = head - 1024;
   rb_slot_t *slot = &rb->buf[*tail & 0x3FF];
-  uint32_t seq0, seq1;
+  uint32_t seq0=0, seq1=0;
   do {
     seq0 = atomic_load_explicit(&slot->seq, memory_order_acquire);
     if (seq0 & 1) continue; // being written
