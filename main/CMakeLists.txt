@@ -1,2 +1,4 @@
-idf_component_register(SRCS "duacan.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(
+	SRCS "duacan.c" "main.c"
+	INCLUDE_DIRS "."
+	REQUIRES driver)

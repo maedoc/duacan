@@ -1,138 +1,37 @@
-#include "hal/twai_types.h"
-#include "portmacro.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
-#include <driver/twai.h>
 #include <hal/cpu_hal.h>
 
-// GPIOs
-#define CAN0_TX 2
-#define CAN0_RX 3
-#define CAN1_TX 4
-#define CAN1_RX 8
+#include "duacan.h"
 
-static void start_one_can(int id, int tx, int rx, twai_handle_t *handle);
-static void start_pings();
-static void duacan_pump();
-static void can_log_status(int id);
-static void can_log_alerts(int id);
+// keep task handles
+TaskHandle_t pump_task;
+TaskHandle_t nanny_task;
+
+// twai handles usable by other modules
+twai_handle_t can0, can1;
+
+static UBaseType_t pump_stack_left;
+static uint32_t rx0ok=0, rx1ok=0, rx0err=0, rx1err=0;
+static uint64_t can_cycles = 0;
 
 static const char *TAG = "duacan";
 
-static twai_handle_t can0, can1;
-static int rx0count=0, rx1count=0;
-static uint64_t can_cycles = 0;
-
-IRAM_ATTR static void pingpong(const twai_handle_t can, const twai_message_t *frame) {
-  if (frame->identifier == 0x123 && frame->data[0] > 0) {
-    twai_message_t next = *frame;
-    esp_err_t e_ping = twai_transmit_v2(can, &next, pdMS_TO_TICKS(1000));
-    if (e_ping != ESP_OK)
-      ESP_LOGE(TAG, "ping fail: %s", esp_err_to_name(e_ping));
-  } else {
-    ESP_LOGI(TAG, "pong! (rx counts are %d and %d)", rx0count, rx1count);
-  }
-}
-
-UBaseType_t pump_stack_left;
-
-// XXX next step is to pull frames into a ring buffer and have another task
-// process, so we prioritize RX; TX can be split into slow/fast
-
-IRAM_ATTR static void duacan_pump()
+static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
 {
-  while (1) {
-    bool worked = false;
-    uint32_t tik = cpu_hal_get_cycle_count();
-    {
-      twai_message_t frame = {0};
-      esp_err_t r0 = twai_receive_v2(can0, &frame, pdMS_TO_TICKS(10));
-      if (r0 == ESP_OK) {
-        rx0count++;
-        frame.data[0]--;
-        pingpong(can0, &frame);
-        worked = true;
-      } else if (r0 != ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "Error receiving from CAN0: %s", esp_err_to_name(r0));
-      }
-    }
-    {
-      twai_message_t frame = {0};
-      esp_err_t r1 = twai_receive_v2(can1, &frame, pdMS_TO_TICKS(10));
-      if (r1 == ESP_OK) {
-        rx1count++;
-        frame.data[1]--;
-        pingpong(can1, &frame);
-        worked = true;
-      } else if (r1 != ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "Error receiving from CAN1: %s", esp_err_to_name(r1));
-      }
-    }
-    if (!worked) {
-      can_log_alerts(0);
-      can_log_alerts(1);
-      pump_stack_left = uxTaskGetStackHighWaterMark(NULL);
-    }
-    can_cycles += cpu_hal_get_cycle_count() - tik;
-  }
-}
-
-
-IRAM_ATTR static void read_twai_alerts_and_print()
-{
-  float delay_s = 0.2f;
-  while(1) {
-    /* can_log_status(0); */
-    /* can_log_status(1); */
-    // esp32c6 is 160 MHz, so can percentage cpu load is num cycles
-    // divied by 160 million cycles*delay time in seconds
-    float can_cpu_pct = (can_cycles / (delay_s*160*1000*1000.0f)) * 100.0f;
-    ESP_LOGI(TAG, "can_cycles = %0.2f %% , stack left %d ", can_cpu_pct, pump_stack_left);
-    can_cycles = 0;
-    vTaskDelay(pdMS_TO_TICKS((int) 1000*delay_s));
-  }
-}
-
-void app_main(void) {
-  start_one_can(0, CAN0_TX, CAN0_RX, &can0);
-  start_one_can(1, CAN1_TX, CAN1_RX, &can1);
-  xTaskCreate(duacan_pump, "duacan_pump", 8192, NULL, 15, NULL);
-  xTaskCreate(start_pings, "start_pings", 4096, NULL, 5, NULL);
-  xTaskCreate(read_twai_alerts_and_print, "read_twai_alerts_and_print", 4096, NULL, 5, NULL);
-}
-
-static void start_one_can(int id, int tx, int rx, twai_handle_t *handle)
-{
+  twai_handle_t can = id == 0 ? can0 : can1;
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(tx, rx, TWAI_MODE_NORMAL);
   g.alerts_enabled = TWAI_ALERT_ALL;
   g.controller_id = id;
   g.rx_queue_len = 128;
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-  twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
+  esp_err_t install_err, start_err;
   ESP_LOGW(TAG, "twai_driver_install_v2(can%d) -> %s", id,
-      esp_err_to_name(twai_driver_install_v2(&g, &t, &f, handle)));
+      esp_err_to_name(install_err=twai_driver_install_v2(&g, &time, &f, &can)));
   ESP_LOGW(TAG, "twai_start_v2(can%d) -> %s", id,
-      esp_err_to_name(twai_start_v2(*handle)));
-}
-
-static void start_pings(void)
-{
-  vTaskDelay(pdMS_TO_TICKS(1000));
-  ESP_LOGI(TAG, "duacan test starting ping");
-  int npings = 50;
-  for (int i=0; i<npings; i++) {
-    twai_message_t frame = {0};
-    frame.identifier = 0x123;
-    frame.data_length_code = 8;
-    frame.data[0] = 250;
-    frame.data[1] = 250;
-    ESP_LOGW(TAG, "ping! transmit -> %s",
-        esp_err_to_name(twai_transmit_v2(can0, &frame, pdMS_TO_TICKS(5000)))); // XXX high transmit patience is important to not timing out
-    vTaskDelay(pdMS_TO_TICKS(5));
-  }
-  ESP_LOGW(TAG, "should have total of %d*250=%d on each rx count", npings, npings*250);
-  vTaskDelete(NULL);
+      esp_err_to_name(start_err=twai_start_v2(can)));
+  return (install_err == ESP_OK && start_err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
 static void dump_status(twai_status_info_t info, int id) {
@@ -170,17 +69,16 @@ static void dump_status(twai_status_info_t info, int id) {
            info.rx_overrun_count, info.arb_lost_count, info.bus_error_count);
 }
 
-static void can_log_status(int id)
+void duacan_log_status(twai_handle_t can)
 {
-  twai_handle_t can = id == 0 ? can0 : can1;
   twai_status_info_t status_info;
   twai_get_status_info_v2(can, &status_info);
-  dump_status(status_info, id);
+  dump_status(status_info, can == can0 ? 0 : 1);
 }
 
-static void can_log_alerts(int id)
+void duacan_log_alerts(twai_handle_t can)
 {
-  twai_handle_t can = id == 0 ? can0 : can1;
+  int id = can == can0 ? 0 : 1;
   uint32_t alerts;
   esp_err_t alert_ret =
       twai_read_alerts_v2(can, &alerts, pdMS_TO_TICKS(1));
@@ -211,4 +109,75 @@ static void can_log_alerts(int id)
   } else {
     ESP_LOGE(TAG, "(id=%d) unable to read alerts", id);
   }
+}
+
+typedef struct rbuf {
+  uint32_t head;
+  twai_message_t buf[1024];
+} rbuf_t;
+
+IRAM_ATTR static void duacan_pump(duacan_handler_t handler)
+{
+  while (1) {
+    uint32_t tik = cpu_hal_get_cycle_count();
+    {
+      twai_message_t frame = {0};
+      esp_err_t r0 = twai_receive_v2(can0, &frame, pdMS_TO_TICKS(10));
+      if (r0 == ESP_OK) {
+        rx0ok++;
+        handler(can0, &frame);
+      } else if (r0 != ESP_ERR_TIMEOUT) {
+        rx0err++;
+      }
+    }
+    {
+      twai_message_t frame = {0};
+      esp_err_t r1 = twai_receive_v2(can1, &frame, pdMS_TO_TICKS(10));
+      if (r1 == ESP_OK) {
+        rx1ok++;
+        handler(can1, &frame);
+      } else if (r1 != ESP_ERR_TIMEOUT) {
+        rx1err++;
+      }
+    }
+    can_cycles += cpu_hal_get_cycle_count() - tik;
+  }
+}
+
+IRAM_ATTR static void duacan_nanny()
+{
+  float delay_s = 0.5f;
+  while(1) {
+    duacan_log_alerts(can0);
+    duacan_log_alerts(can1);
+    pump_stack_left = uxTaskGetStackHighWaterMark(NULL);
+    // esp32c6 is 160 MHz, so can percentage cpu load is num cycles
+    // divied by 160 million cycles*delay time in seconds
+    float can_cpu_pct = (can_cycles / (delay_s*160*1000*1000.0f)) * 100.0f;
+    can_cycles = 0;
+    ESP_LOGI(TAG, "can_cycles = %0.2f %% , stack left %d ", can_cpu_pct, pump_stack_left);
+    // log rx0ok/err and rx1ok/err
+    ESP_LOGI(TAG, "can0 rx ok=%" PRIu32 ", err=%" PRIu32 ", can1 rx ok=%" PRIu32 ", err=%" PRIu32,
+             rx0ok, rx0err, rx1ok, rx1err);
+    // XXX TODO recover from bus error/off states
+    vTaskDelay(pdMS_TO_TICKS((int) 1000*delay_s));
+  }
+}
+
+esp_err_t duacan_start(
+    int tx0, int rx0, twai_timing_config_t time0,
+    int tx1, int rx1, twai_timing_config_t time1,
+    duacan_handler_t handler)
+{
+  esp_err_t e0 = start_one(0, tx0, rx0, time0);
+  esp_err_t e1 = start_one(1, tx1, rx1, time1);
+  if (e0 != ESP_OK || e1 != ESP_OK)
+    return ESP_FAIL;
+  BaseType_t pump_ret = xTaskCreate((void(*)(void*)) duacan_pump, "duacan_pump", 8192, (void*) handler, 15, &pump_task);
+  if (pump_ret != pdPASS)
+    ESP_LOGE(TAG, "Failed to create duacan_pump task");
+  BaseType_t nanny_ret = xTaskCreate(duacan_nanny, "duacan_nanny", 4096, NULL, 5, &nanny_task);
+  if (nanny_ret != pdPASS)
+    ESP_LOGE(TAG, "Failed to create duacan_nanny task");
+  return (pump_ret == pdPASS && nanny_ret == pdPASS) ? ESP_OK : ESP_FAIL;
 }
