@@ -264,7 +264,7 @@ static void nanny()
     // divied by 160 million cycles*delay time in seconds
     float can_cpu_pct = (can_cycles / (delay_s*160*1000*1000.0f)) * 100.0f;
     can_cycles = 0;
-    ESP_LOGI(TAG, "can_cpu=%0.2f %%,pump_stack_free=%d,nanny_stack_free=%d,"
+    ESP_LOGI(TAG, "can_cpu=%0.2f%%,pump_stack_free=%d,nanny_stack_free=%d,"
        "rx0ok=%" PRIu32 ",rx0err=%" PRIu32 ",rx1ok=%" PRIu32 ",rx1err=%" PRIu32,
         can_cpu_pct,
         uxTaskGetStackHighWaterMark(pump_task),
