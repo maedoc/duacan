@@ -3,6 +3,7 @@
 #include <esp_log.h>
 #include <hal/cpu_hal.h>
 #include <stdatomic.h>
+#include <esp_timer.h>
 
 #include "duacan.h"
 
@@ -13,9 +14,8 @@ TaskHandle_t nanny_task;
 // twai handles usable by other modules
 twai_handle_t can0=NULL, can1=NULL;
 
-static UBaseType_t pump_stack_left;
 static uint32_t rx0ok=0, rx1ok=0, rx0err=0, rx1err=0;
-static uint64_t can_cycles = 0;
+static uint32_t can_cycles = 0;
 
 static const char *TAG = "duacan";
 
@@ -251,27 +251,35 @@ IRAM_ATTR static void pump(duacan_handler_t caller_handler)
   }
 }
 
-static void nanny()
+IRAM_ATTR static void nanny()
 {
-  float delay_s = 2.f;
-  ESP_LOGI(TAG, "duacan_nanny started with %.2f s delay", delay_s);
+  const TickType_t period = pdMS_TO_TICKS(1000);
+  TickType_t last_wake = xTaskGetTickCount();
+  // Clear initial counters so first print is accurate to the first second
+  rx0ok = 0; rx1ok = 0; rx0err = 0; rx1err = 0; can_cycles = 0;
   while(1) {
+    // This ensures the loop starts exactly 'period' ticks after the previous start
+    vTaskDelayUntil(&last_wake, period);
     duacan_log_status(can0);
     duacan_log_alerts(can0);
     duacan_log_status(can1);
     duacan_log_alerts(can1);
-    // esp32c6 is 160 MHz, so can percentage cpu load is num cycles
-    // divied by 160 million cycles*delay time in seconds
-    float can_cpu_pct = (can_cycles / (delay_s*160*1000*1000.0f)) * 100.0f;
+    // simple integer math: cycles / 160M = cpu seconds used.
+    // since period is 1s, cpu seconds * 100 = pct.
+    // (cycles * 100) / 160000000 -> cycles / 1600000
+    uint32_t can_cpu_pct = (uint32_t)(can_cycles / 1600000ULL);
+    // Snapshots for logging
+    uint32_t r0 = rx0ok, r1 = rx1ok, e0 = rx0err, e1 = rx1err;
+    // Reset counters for the next second
     can_cycles = 0;
-    ESP_LOGI(TAG, "can_cpu=%0.2f%%,pump_stack_free=%d,nanny_stack_free=%d,"
-       "rx0ok=%" PRIu32 ",rx0err=%" PRIu32 ",rx1ok=%" PRIu32 ",rx1err=%" PRIu32,
+    rx0ok = 0; rx1ok = 0; rx0err = 0; rx1err = 0;
+    ESP_LOGI(TAG, "can_cpu=%" PRIu32 "%%,pump_stack=%d,nanny_stack=%d,"
+             "rx0=%" PRIu32 "/s,err0=%" PRIu32 "/s,rx1=%" PRIu32 "/s,err1=%" PRIu32 "/s",
         can_cpu_pct,
         uxTaskGetStackHighWaterMark(pump_task),
         uxTaskGetStackHighWaterMark(nanny_task),
-        rx0ok, rx0err, rx1ok, rx1err
+        r0, e0, r1, e1
         );
-    vTaskDelay(pdMS_TO_TICKS((int) 1000*delay_s));
   }
 }
 
