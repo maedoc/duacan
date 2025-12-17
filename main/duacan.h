@@ -6,7 +6,7 @@
 extern twai_handle_t can0, can1;
 
 // debug
-void duacan_log_status(twai_handle_t can);
+twai_status_info_t duacan_log_status(twai_handle_t can);
 void duacan_log_alerts(twai_handle_t can);
 
 // fast-path handler callback, declare w/ IRAM_ATTR!

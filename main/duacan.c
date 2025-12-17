@@ -10,29 +10,13 @@ TaskHandle_t pump_task;
 TaskHandle_t nanny_task;
 
 // twai handles usable by other modules
-twai_handle_t can0, can1;
+twai_handle_t can0=NULL, can1=NULL;
 
 static UBaseType_t pump_stack_left;
 static uint32_t rx0ok=0, rx1ok=0, rx0err=0, rx1err=0;
 static uint64_t can_cycles = 0;
 
 static const char *TAG = "duacan";
-
-static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
-{
-  twai_handle_t can = id == 0 ? can0 : can1;
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(tx, rx, TWAI_MODE_NORMAL);
-  g.alerts_enabled = TWAI_ALERT_ALL;
-  g.controller_id = id;
-  g.rx_queue_len = 128;
-  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-  esp_err_t install_err, start_err;
-  ESP_LOGW(TAG, "twai_driver_install_v2(can%d) -> %s", id,
-      esp_err_to_name(install_err=twai_driver_install_v2(&g, &time, &f, &can)));
-  ESP_LOGW(TAG, "twai_start_v2(can%d) -> %s", id,
-      esp_err_to_name(start_err=twai_start_v2(can)));
-  return (install_err == ESP_OK && start_err == ESP_OK) ? ESP_OK : ESP_FAIL;
-}
 
 static void dump_status(twai_status_info_t info, int id) {
   char *state;
@@ -51,29 +35,52 @@ static void dump_status(twai_status_info_t info, int id) {
     break;
   default:
     state = "UNKNOWN";
-    ESP_LOGE(TAG, "(id=%d) unknown twai state!", id);
+    ESP_LOGE(TAG, "can%d unknown twai state!", id);
   }
-  ESP_LOGI(TAG,
-           "(id=%d) twai status state=%s, "
-           "msgs_to_tx=%" PRIu32 ", "
-           "msgs_to_rx=%" PRIu32 ", "
-           "tx_error_counter=%" PRIu32 ", "
-           "rx_error_counter=%" PRIu32 ", "
-           "tx_failed_count=%" PRIu32 ", "
-           "rx_missed_count=%" PRIu32 ", "
-           "rx_overrun_count=%" PRIu32 ", "
-           "arb_lost_count=%" PRIu32 ", "
-           "bus_error_count=%" PRIu32,
-           id, state, info.msgs_to_tx, info.msgs_to_rx, info.tx_error_counter,
-           info.rx_error_counter, info.tx_failed_count, info.rx_missed_count,
-           info.rx_overrun_count, info.arb_lost_count, info.bus_error_count);
+#define LOGSTUFF "can%d state=%s,msgs_to_tx=%" PRIu32 ",msgs_to_rx=%" PRIu32 "," \
+           "tx_error_counter=%" PRIu32 ",rx_error_counter=%" PRIu32 ",tx_failed_count=%" PRIu32 "," \
+           "rx_missed_count=%" PRIu32 ",rx_overrun_count=%" PRIu32 ",arb_lost_count=%" PRIu32 "," \
+           "bus_error_count=%" PRIu32, id, state, info.msgs_to_tx, info.msgs_to_rx, info.tx_error_counter, \
+           info.rx_error_counter, info.tx_failed_count, info.rx_missed_count, \
+           info.rx_overrun_count, info.arb_lost_count, info.bus_error_count
+  if ( (info.state != TWAI_STATE_RUNNING)
+      || (info.tx_error_counter > 0)
+      || (info.rx_error_counter > 0)
+      || (info.tx_failed_count > 0)
+      || (info.rx_missed_count > 0)
+      || (info.rx_overrun_count > 0)
+      || (info.arb_lost_count > 0)
+      || (info.bus_error_count > 0) )
+    ESP_LOGW(TAG, LOGSTUFF);
+  else
+    ESP_LOGD(TAG, LOGSTUFF);
+#undef LOGSTUFF
 }
 
-void duacan_log_status(twai_handle_t can)
+twai_status_info_t duacan_log_status(twai_handle_t can)
 {
-  twai_status_info_t status_info;
-  twai_get_status_info_v2(can, &status_info);
-  dump_status(status_info, can == can0 ? 0 : 1);
+  twai_status_info_t status;
+  twai_get_status_info_v2(can, &status);
+  dump_status(status, can == can0 ? 0 : 1);
+  switch (status.state) {
+  case TWAI_STATE_BUS_OFF:
+    ESP_LOGW(TAG, "can%d twai in BUS_OFF, initiating recovery",
+             can == can0 ? 0 : 1);
+    twai_initiate_recovery_v2(can);
+    break;
+  case TWAI_STATE_RECOVERING:
+    ESP_LOGW(TAG, "can%d twai recovering...", can == can0 ? 0 : 1);
+    break;
+  case TWAI_STATE_STOPPED:
+    ESP_LOGW(TAG, "can%d twai stopped, starting...", can == can0 ? 0 : 1);
+    twai_start_v2(can);
+    break;
+  case TWAI_STATE_RUNNING:
+    break;
+  default:
+    break;
+  }
+  return status;
 }
 
 void duacan_log_alerts(twai_handle_t can)
@@ -116,52 +123,90 @@ typedef struct rbuf {
   twai_message_t buf[1024];
 } rbuf_t;
 
+static rbuf_t rx0buf = {0}, rx1buf = {0};
+
 IRAM_ATTR static void duacan_pump(duacan_handler_t handler)
 {
+  TickType_t patience = pdMS_TO_TICKS(10.f);
   while (1) {
+    bool worked = false;
     uint32_t tik = cpu_hal_get_cycle_count();
     {
       twai_message_t frame = {0};
-      esp_err_t r0 = twai_receive_v2(can0, &frame, pdMS_TO_TICKS(10));
+      esp_err_t r0 = twai_receive_v2(can0, &frame, patience);
       if (r0 == ESP_OK) {
         rx0ok++;
         handler(can0, &frame);
+        worked = true;
       } else if (r0 != ESP_ERR_TIMEOUT) {
         rx0err++;
       }
     }
     {
       twai_message_t frame = {0};
-      esp_err_t r1 = twai_receive_v2(can1, &frame, pdMS_TO_TICKS(10));
+      esp_err_t r1 = twai_receive_v2(can1, &frame, patience);
       if (r1 == ESP_OK) {
         rx1ok++;
         handler(can1, &frame);
+        worked = true;
       } else if (r1 != ESP_ERR_TIMEOUT) {
         rx1err++;
       }
     }
     can_cycles += cpu_hal_get_cycle_count() - tik;
+    if (!worked) {
+      vTaskDelay(patience);
+    }
   }
 }
 
-IRAM_ATTR static void duacan_nanny()
+static void duacan_nanny()
 {
-  float delay_s = 0.5f;
+  float delay_s = 2.f;
+  ESP_LOGI(TAG, "duacan_nanny started with %.2f s delay", delay_s);
   while(1) {
+    duacan_log_status(can0);
     duacan_log_alerts(can0);
+    duacan_log_status(can1);
     duacan_log_alerts(can1);
-    pump_stack_left = uxTaskGetStackHighWaterMark(NULL);
     // esp32c6 is 160 MHz, so can percentage cpu load is num cycles
     // divied by 160 million cycles*delay time in seconds
     float can_cpu_pct = (can_cycles / (delay_s*160*1000*1000.0f)) * 100.0f;
     can_cycles = 0;
-    ESP_LOGI(TAG, "can_cycles = %0.2f %% , stack left %d ", can_cpu_pct, pump_stack_left);
-    // log rx0ok/err and rx1ok/err
-    ESP_LOGI(TAG, "can0 rx ok=%" PRIu32 ", err=%" PRIu32 ", can1 rx ok=%" PRIu32 ", err=%" PRIu32,
-             rx0ok, rx0err, rx1ok, rx1err);
-    // XXX TODO recover from bus error/off states
+    ESP_LOGI(TAG, "can_cpu=%0.2f %%,pump_stack_free=%d,nanny_stack_free=%d,"
+       "rx0ok=%" PRIu32 ",rx0err=%" PRIu32 ",rx1ok=%" PRIu32 ",rx1err=%" PRIu32,
+        can_cpu_pct,
+        uxTaskGetStackHighWaterMark(pump_task),
+        uxTaskGetStackHighWaterMark(nanny_task),
+        rx0ok, rx0err, rx1ok, rx1err
+        );
     vTaskDelay(pdMS_TO_TICKS((int) 1000*delay_s));
   }
+}
+
+static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
+{
+  twai_handle_t *can = id == 0 ? &can0 : &can1;
+  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(tx, rx, TWAI_MODE_NORMAL);
+  g.alerts_enabled = TWAI_ALERT_ALL;
+  g.controller_id = id;
+  g.rx_queue_len = 128;
+  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  esp_err_t install_err, start_err;
+
+  ESP_LOGW(TAG, "twai_driver_install_v2(can%d) -> %s", id,
+      esp_err_to_name(install_err=twai_driver_install_v2(&g, &time, &f, can)));
+
+  ESP_LOGW(TAG, "twai_start_v2(can%d) -> %s", id,
+      esp_err_to_name(start_err=twai_start_v2(*can)));
+  vTaskDelay(pdMS_TO_TICKS(100));
+  twai_status_info_t status = duacan_log_status(*can);
+  duacan_log_alerts(*can);
+  if (status.state != TWAI_STATE_RUNNING) {
+    ESP_LOGE(TAG, "can%d not running after start!", id);
+    return ESP_FAIL;
+  }
+  return (install_err == ESP_OK && start_err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t duacan_start(
@@ -176,7 +221,7 @@ esp_err_t duacan_start(
   BaseType_t pump_ret = xTaskCreate((void(*)(void*)) duacan_pump, "duacan_pump", 8192, (void*) handler, 15, &pump_task);
   if (pump_ret != pdPASS)
     ESP_LOGE(TAG, "Failed to create duacan_pump task");
-  BaseType_t nanny_ret = xTaskCreate(duacan_nanny, "duacan_nanny", 4096, NULL, 5, &nanny_task);
+  BaseType_t nanny_ret = xTaskCreate(duacan_nanny, "duacan_nanny", 8192, NULL, 5, &nanny_task);
   if (nanny_ret != pdPASS)
     ESP_LOGE(TAG, "Failed to create duacan_nanny task");
   return (pump_ret == pdPASS && nanny_ret == pdPASS) ? ESP_OK : ESP_FAIL;

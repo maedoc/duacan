@@ -82,6 +82,18 @@ static void start_pings(void)
     vTaskDelay(pdMS_TO_TICKS(5));
   }
   ESP_LOGW(TAG, "should have total of %d*250=%d on each rx count", npings, npings*250);
+  vTaskDelay(pdMS_TO_TICKS(10000));
+  ESP_LOGI(TAG, "starting regular pings but spaced by 2s");
+  while (1) {
+    twai_message_t frame = {0};
+    frame.identifier = 0x123;
+    frame.data_length_code = 8;
+    frame.data[0] = 250;
+    frame.data[1] = 250;
+    ESP_LOGW(TAG, "ping! transmit -> %s",
+        esp_err_to_name(twai_transmit_v2(can0, &frame, pdMS_TO_TICKS(5000))));
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
   vTaskDelete(NULL);
 }
 
