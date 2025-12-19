@@ -206,11 +206,13 @@ IRAM_ATTR static bool rx_callback(twai_handle_t can, const twai_message_t *frame
   int id = can == can0 ? 0 : 1;
   rbuf_t *rb = can == can0 ? &rx0buf : &rx1buf;
   rb_write(rb, frame);
+  // Capture head value after write completes
+  size_t head_val = atomic_load_explicit(&rb->head, memory_order_acquire);
   // notify subscribers
   for (int i=0; i<4; i++) {
     if (subs[id][i] != NULL) {
       BaseType_t higher_prio_task_woken = pdFALSE;
-      xTaskNotifyFromISR(subs[id][i], rb->head, eSetValueWithOverwrite, &higher_prio_task_woken);
+      xTaskNotifyFromISR(subs[id][i], head_val, eSetValueWithOverwrite, &higher_prio_task_woken);
       if (higher_prio_task_woken == pdTRUE) {
         portYIELD_FROM_ISR();
       }
@@ -264,13 +266,25 @@ static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
 
   ESP_LOGW(TAG, "twai_driver_install_v2(can%d) -> %s", id,
       esp_err_to_name(install_err=twai_driver_install_v2(&g, &time, &f, can)));
+  if (install_err != ESP_OK) {
+    return ESP_FAIL;
+  }
 
-  // Register RX callback
-  ESP_LOGW(TAG, "twai_register_rx_callback_v2(can%d) -> %s", id,
-      esp_err_to_name(callback_err=twai_register_rx_callback_v2(*can, rx_callback, NULL)));
+  // Register RX callback before starting
+  callback_err = twai_register_rx_callback_v2(*can, rx_callback, NULL);
+  if (callback_err != ESP_OK) {
+    ESP_LOGE(TAG, "twai_register_rx_callback_v2(can%d) failed: %s", id,
+        esp_err_to_name(callback_err));
+    return ESP_FAIL;
+  }
+  ESP_LOGW(TAG, "twai_register_rx_callback_v2(can%d) -> %s", id, esp_err_to_name(callback_err));
 
   ESP_LOGW(TAG, "twai_start_v2(can%d) -> %s", id,
       esp_err_to_name(start_err=twai_start_v2(*can)));
+  if (start_err != ESP_OK) {
+    return ESP_FAIL;
+  }
+
   vTaskDelay(pdMS_TO_TICKS(100));
   twai_status_info_t status = duacan_log_status(*can);
   duacan_log_alerts(*can);
@@ -278,7 +292,7 @@ static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
     ESP_LOGE(TAG, "can%d not running after start!", id);
     return ESP_FAIL;
   }
-  return (install_err == ESP_OK && start_err == ESP_OK && callback_err == ESP_OK) ? ESP_OK : ESP_FAIL;
+  return ESP_OK;
 }
 
 esp_err_t duacan_start(
