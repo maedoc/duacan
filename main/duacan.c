@@ -12,7 +12,7 @@ TaskHandle_t nanny_task;
 // twai handles usable by other modules
 twai_handle_t can0=NULL, can1=NULL;
 
-static uint32_t rx0ok=0, rx1ok=0, rx0err=0, rx1err=0;
+static uint32_t rx0ok=0, rx1ok=0;
 
 static const char *TAG = "duacan";
 
@@ -233,7 +233,7 @@ IRAM_ATTR static void nanny()
   const TickType_t period = pdMS_TO_TICKS(1000);
   TickType_t last_wake = xTaskGetTickCount();
   // Clear initial counters so first print is accurate to the first second
-  rx0ok = 0; rx1ok = 0; rx0err = 0; rx1err = 0;
+  rx0ok = 0; rx1ok = 0;
   while(1) {
     // This ensures the loop starts exactly 'period' ticks after the previous start
     vTaskDelayUntil(&last_wake, period);
@@ -241,14 +241,13 @@ IRAM_ATTR static void nanny()
     duacan_log_alerts(can0);
     duacan_log_status(can1);
     duacan_log_alerts(can1);
-    // Snapshots for logging
-    uint32_t r0 = rx0ok, r1 = rx1ok, e0 = rx0err, e1 = rx1err;
+    // Snapshots for logging (errors now reported via alerts)
+    uint32_t r0 = rx0ok, r1 = rx1ok;
     // Reset counters for the next second
-    rx0ok = 0; rx1ok = 0; rx0err = 0; rx1err = 0;
-    ESP_LOGI(TAG, "nanny_stack=%d,"
-             "rx0=%" PRIu32 "/s,err0=%" PRIu32 "/s,rx1=%" PRIu32 "/s,err1=%" PRIu32 "/s",
+    rx0ok = 0; rx1ok = 0;
+    ESP_LOGI(TAG, "nanny_stack=%d,rx0=%" PRIu32 "/s,rx1=%" PRIu32 "/s",
         uxTaskGetStackHighWaterMark(nanny_task),
-        r0, e0, r1, e1
+        r0, r1
         );
   }
 }
@@ -270,7 +269,7 @@ static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
     return ESP_FAIL;
   }
 
-  // Register RX callback before starting
+  // Register RX callback before starting to ensure no frames are missed
   callback_err = twai_register_rx_callback_v2(*can, rx_callback, NULL);
   if (callback_err != ESP_OK) {
     ESP_LOGE(TAG, "twai_register_rx_callback_v2(can%d) failed: %s", id,
