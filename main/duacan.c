@@ -207,16 +207,16 @@ IRAM_ATTR static bool rx_callback(twai_handle_t can, const twai_message_t *frame
   rbuf_t *rb = can == can0 ? &rx0buf : &rx1buf;
   rb_write(rb, frame);
   // Capture head value after write completes
-  size_t head_val = atomic_load_explicit(&rb->head, memory_order_acquire);
+  size_t head_val = atomic_load(&rb->head);
   // notify subscribers
+  BaseType_t higher_prio_task_woken = pdFALSE;
   for (int i=0; i<4; i++) {
     if (subs[id][i] != NULL) {
-      BaseType_t higher_prio_task_woken = pdFALSE;
       xTaskNotifyFromISR(subs[id][i], head_val, eSetValueWithOverwrite, &higher_prio_task_woken);
-      if (higher_prio_task_woken == pdTRUE) {
-        portYIELD_FROM_ISR();
-      }
     }
+  }
+  if (higher_prio_task_woken == pdTRUE) {
+    portYIELD_FROM_ISR();
   }
   // Update stats
   if (can == can0)
