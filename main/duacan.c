@@ -1,21 +1,18 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
-#include <hal/cpu_hal.h>
 #include <stdatomic.h>
 #include <esp_timer.h>
 
 #include "duacan.h"
 
 // keep task handles
-TaskHandle_t pump_task;
 TaskHandle_t nanny_task;
 
 // twai handles usable by other modules
 twai_handle_t can0=NULL, can1=NULL;
 
 static uint32_t rx0ok=0, rx1ok=0, rx0err=0, rx1err=0;
-static uint32_t can_cycles = 0;
 
 static const char *TAG = "duacan";
 
@@ -203,60 +200,38 @@ esp_err_t duacan_subscribe(twai_handle_t can, TaskHandle_t reader_task)
   return ESP_ERR_NO_MEM;
 }
 
-// if handler is NULL, pump writes frames into 
-IRAM_ATTR static void default_handler(const twai_handle_t can, const twai_message_t *frame)
+// ISR-safe callback for TWAI RX events
+IRAM_ATTR static bool rx_callback(twai_handle_t can, const twai_message_t *frame, void *user_arg)
 {
   int id = can == can0 ? 0 : 1;
   rbuf_t *rb = can == can0 ? &rx0buf : &rx1buf;
   rb_write(rb, frame);
-  // notify
-  for (int i=0; i<4; i++)
-    if (subs[id][i] != NULL)
-      xTaskNotify(subs[id][i], rb->head, eSetValueWithOverwrite);
-}
-
-IRAM_ATTR static void pump(duacan_handler_t caller_handler)
-{
-  TickType_t patience = pdMS_TO_TICKS(10.f);
-  duacan_handler_t handler = caller_handler != NULL ? caller_handler : default_handler;
-  while (1) {
-    bool worked = false;
-    uint32_t tik = cpu_hal_get_cycle_count();
-    {
-      twai_message_t frame = {0};
-      esp_err_t r0 = twai_receive_v2(can0, &frame, patience);
-      if (r0 == ESP_OK) {
-        rx0ok++;
-        handler(can0, &frame);
-        worked = true;
-      } else if (r0 != ESP_ERR_TIMEOUT) {
-        rx0err++;
+  // notify subscribers
+  for (int i=0; i<4; i++) {
+    if (subs[id][i] != NULL) {
+      BaseType_t higher_prio_task_woken = pdFALSE;
+      xTaskNotifyFromISR(subs[id][i], rb->head, eSetValueWithOverwrite, &higher_prio_task_woken);
+      if (higher_prio_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
       }
-    }
-    {
-      twai_message_t frame = {0};
-      esp_err_t r1 = twai_receive_v2(can1, &frame, patience);
-      if (r1 == ESP_OK) {
-        rx1ok++;
-        handler(can1, &frame);
-        worked = true;
-      } else if (r1 != ESP_ERR_TIMEOUT) {
-        rx1err++;
-      }
-    }
-    can_cycles += cpu_hal_get_cycle_count() - tik;
-    if (!worked) {
-      vTaskDelay(patience);
     }
   }
+  // Update stats
+  if (can == can0)
+    rx0ok++;
+  else
+    rx1ok++;
+  return true; // Return true to indicate frame was handled
 }
+
+
 
 IRAM_ATTR static void nanny()
 {
   const TickType_t period = pdMS_TO_TICKS(1000);
   TickType_t last_wake = xTaskGetTickCount();
   // Clear initial counters so first print is accurate to the first second
-  rx0ok = 0; rx1ok = 0; rx0err = 0; rx1err = 0; can_cycles = 0;
+  rx0ok = 0; rx1ok = 0; rx0err = 0; rx1err = 0;
   while(1) {
     // This ensures the loop starts exactly 'period' ticks after the previous start
     vTaskDelayUntil(&last_wake, period);
@@ -264,19 +239,12 @@ IRAM_ATTR static void nanny()
     duacan_log_alerts(can0);
     duacan_log_status(can1);
     duacan_log_alerts(can1);
-    // simple integer math: cycles / 160M = cpu seconds used.
-    // since period is 1s, cpu seconds * 100 = pct.
-    // (cycles * 100) / 160000000 -> cycles / 1600000
-    uint32_t can_cpu_pct = (uint32_t)(can_cycles / 1600000ULL);
     // Snapshots for logging
     uint32_t r0 = rx0ok, r1 = rx1ok, e0 = rx0err, e1 = rx1err;
     // Reset counters for the next second
-    can_cycles = 0;
     rx0ok = 0; rx1ok = 0; rx0err = 0; rx1err = 0;
-    ESP_LOGI(TAG, "can_cpu=%" PRIu32 "%%,pump_stack=%d,nanny_stack=%d,"
+    ESP_LOGI(TAG, "nanny_stack=%d,"
              "rx0=%" PRIu32 "/s,err0=%" PRIu32 "/s,rx1=%" PRIu32 "/s,err1=%" PRIu32 "/s",
-        can_cpu_pct,
-        uxTaskGetStackHighWaterMark(pump_task),
         uxTaskGetStackHighWaterMark(nanny_task),
         r0, e0, r1, e1
         );
@@ -292,10 +260,14 @@ static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
   g.rx_queue_len = 128;
   g.tx_queue_len = 128;
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-  esp_err_t install_err, start_err;
+  esp_err_t install_err, start_err, callback_err;
 
   ESP_LOGW(TAG, "twai_driver_install_v2(can%d) -> %s", id,
       esp_err_to_name(install_err=twai_driver_install_v2(&g, &time, &f, can)));
+
+  // Register RX callback
+  ESP_LOGW(TAG, "twai_register_rx_callback_v2(can%d) -> %s", id,
+      esp_err_to_name(callback_err=twai_register_rx_callback_v2(*can, rx_callback, NULL)));
 
   ESP_LOGW(TAG, "twai_start_v2(can%d) -> %s", id,
       esp_err_to_name(start_err=twai_start_v2(*can)));
@@ -306,23 +278,19 @@ static esp_err_t start_one(int id, int tx, int rx, twai_timing_config_t time)
     ESP_LOGE(TAG, "can%d not running after start!", id);
     return ESP_FAIL;
   }
-  return (install_err == ESP_OK && start_err == ESP_OK) ? ESP_OK : ESP_FAIL;
+  return (install_err == ESP_OK && start_err == ESP_OK && callback_err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t duacan_start(
     int tx0, int rx0, twai_timing_config_t time0,
-    int tx1, int rx1, twai_timing_config_t time1,
-    duacan_handler_t handler)
+    int tx1, int rx1, twai_timing_config_t time1)
 {
   esp_err_t e0 = start_one(0, tx0, rx0, time0);
   esp_err_t e1 = start_one(1, tx1, rx1, time1);
   if (e0 != ESP_OK || e1 != ESP_OK)
     return ESP_FAIL;
-  BaseType_t pump_ret = xTaskCreate((void(*)(void*)) pump, "duacan_pump", 8192, (void*) handler, 15, &pump_task);
-  if (pump_ret != pdPASS)
-    ESP_LOGE(TAG, "Failed to create duacan_pump task");
   BaseType_t nanny_ret = xTaskCreate(nanny, "duacan_nanny", 8192, NULL, 5, &nanny_task);
   if (nanny_ret != pdPASS)
     ESP_LOGE(TAG, "Failed to create duacan_nanny task");
-  return (pump_ret == pdPASS && nanny_ret == pdPASS) ? ESP_OK : ESP_FAIL;
+  return (nanny_ret == pdPASS) ? ESP_OK : ESP_FAIL;
 }

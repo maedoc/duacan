@@ -91,8 +91,7 @@ void app_main(void) {
   twai_timing_config_t can_time = TWAI_TIMING_CONFIG_500KBITS();
   assert(ESP_OK == duacan_start(
         CAN0_TX, CAN0_RX, can_time,
-        CAN1_TX, CAN1_RX, can_time,
-        NULL));
+        CAN1_TX, CAN1_RX, can_time));
   /* xTaskCreate(reader, "reader", 4096, NULL, 10, NULL); */
   xTaskCreate(sub0, "sub0", 4096, NULL, 10, NULL);
   xTaskCreate(sub1, "sub1", 4096, NULL, 10, NULL);
